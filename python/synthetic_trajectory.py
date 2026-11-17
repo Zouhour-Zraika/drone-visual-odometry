@@ -1,147 +1,109 @@
+"""Synthetic monocular VO benchmark.
 
+The ground-truth step length is an *oracle* used only to study pose-estimation
+error. Monocular essential-matrix geometry cannot recover metric scale.
+Run from the repository root: python python/synthetic_trajectory.py
+"""
+from pathlib import Path
 import cv2
-import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from pathlib import Path
+import numpy as np
 
-Path("results").mkdir(exist_ok=True)
-
+OUT = Path(__file__).resolve().parents[1] / "results"
+OUT.mkdir(parents=True, exist_ok=True)
 rng = np.random.default_rng(42)
-
-# Calibration de la caméra virtuelle
-K = np.array([
-    [450, 0, 320],
-    [0, 450, 240],
-    [0, 0, 1]
-], dtype=np.float64)
-
-# Points fixes dans le monde
-points_3d = np.column_stack([
+K = np.array([[450., 0., 320.], [0., 450., 240.], [0., 0., 1.]])
+N = 40
+points_world = np.column_stack((
     rng.uniform(-5, 5, 1000),
     rng.uniform(-3, 3, 1000),
-    rng.uniform(6, 18, 1000)
-])
+    rng.uniform(6, 18, 1000),
+))
+truth = np.array([[.12*i, .15*np.sin(i/8), .03*i] for i in range(N)])
 
-# Trajectoire réelle : positions des caméras
-N = 40
-true_positions = np.array([
-    [0.12 * i,
-     0.15 * np.sin(i / 8),
-     0.03 * i]
-    for i in range(N)
-])
+def project(center):
+    camera_points = points_world - center
+    uvw = (K @ camera_points.T).T
+    return uvw[:, :2] / uvw[:, 2:]
 
-# Toutes les caméras ont la même orientation
-R_world_cam = np.eye(3)
+observations = [project(c) + rng.normal(0, .25, (len(points_world), 2))
+                for c in truth]
 
-def project(position):
-    # Transformation monde -> caméra
-    t = -R_world_cam @ position
-    camera_pts = (
-        R_world_cam @ points_3d.T
-    ).T + t
-
-    pixels = (K @ camera_pts.T).T
-    return pixels[:, :2] / pixels[:, 2:3]
-
-# Générer les observations avec du bruit
-observations = [
-    project(p) + rng.normal(0, 0.25, (1000, 2))
-    for p in true_positions
-]
-
-# Pose monde -> caméra estimée
+# T_cw maps world coordinates into camera coordinates.
 R_cw = np.eye(3)
 t_cw = np.zeros((3, 1))
-
-estimated_positions = [np.zeros(3)]
-inlier_counts = []
+estimated = [np.zeros(3)]
+inliers_per_step = []
+rotation_errors_deg = []
+translation_direction_errors_deg = []
 
 for i in range(1, N):
-    pts1 = observations[i - 1]
-    pts2 = observations[i]
-
-    E, mask = cv2.findEssentialMat(
-        pts1, pts2, K,
-        method=cv2.RANSAC,
-        prob=0.999,
-        threshold=1.0
-    )
-
+    p1, p2 = observations[i-1], observations[i]
+    E, mask = cv2.findEssentialMat(p1, p2, K, method=cv2.RANSAC,
+                                   prob=.999, threshold=1.)
     if E is None:
-        raise RuntimeError(f"Echec image {i}")
+        raise RuntimeError(f"Essential matrix estimation failed at frame {i}")
+    count, R_rel, t_rel, pose_mask = cv2.recoverPose(E, p1, p2, K, mask=mask)
+    if count < 8:
+        raise RuntimeError(f"Insufficient pose inliers at frame {i}: {count}")
+    inliers_per_step.append(int(count))
 
-    inliers, R_rel, t_rel, _ = cv2.recoverPose(
-        E, pts1, pts2, K, mask=mask
-    )
-    inlier_counts.append(inliers)
+    # The cameras have identical true orientation: R_relative_true = I.
+    angle = np.arccos(np.clip((np.trace(R_rel) - 1) / 2, -1, 1))
+    rotation_errors_deg.append(float(np.degrees(angle)))
 
-    # Echelle connue de la simulation
-    # (oracle, indisponible en monoculaire réel)
-    scale = np.linalg.norm(
-        true_positions[i] - true_positions[i - 1]
-    )
+    # With identity true rotations, relative camera translation is -delta_C.
+    true_step = truth[i] - truth[i-1]
+    true_camera_translation_direction = -true_step / np.linalg.norm(true_step)
+    estimated_direction = t_rel.ravel() / np.linalg.norm(t_rel)
+    direction_angle = np.arccos(np.clip(
+        estimated_direction @ true_camera_translation_direction, -1, 1))
+    translation_direction_errors_deg.append(float(np.degrees(direction_angle)))
 
-    # Composition des poses monde -> caméra
+    # ORACLE SCALE: supplied by simulated ground truth, not recovered by VO.
+    scale = np.linalg.norm(true_step)
     t_cw = R_rel @ t_cw + scale * t_rel
     R_cw = R_rel @ R_cw
+    estimated.append((-R_cw.T @ t_cw).ravel())
 
-    # Centre de caméra exprimé dans le monde
-    camera_center = -R_cw.T @ t_cw
-    estimated_positions.append(camera_center.ravel())
+estimated = np.asarray(estimated)
+errors = np.linalg.norm(estimated - truth, axis=1)
+rmse = float(np.sqrt(np.mean(errors**2)))
+print("=== SYNTHETIC MONOCULAR VO (ORACLE SCALE) ===")
+print(f"Poses: {N}")
+print(f"Mean pose inliers: {np.mean(inliers_per_step):.1f}")
+print(f"Position RMSE: {rmse:.4f} m")
+print(f"Mean relative rotation error: {np.mean(rotation_errors_deg):.3f} deg")
+print(f"Mean translation-direction error: {np.mean(translation_direction_errors_deg):.3f} deg")
+print("WARNING: metric step lengths come from ground truth; this is not metric monocular VO.")
 
-estimated_positions = np.array(estimated_positions)
-
-errors = np.linalg.norm(
-    estimated_positions - true_positions, axis=1
-)
-rmse = np.sqrt(np.mean(errors ** 2))
-
-print("=== TRAJECTOIRE SYNTHETIQUE ===")
-print(f"Nombre de poses : {N}")
-print(f"Inliers moyens : {np.mean(inlier_counts):.1f}")
-print(f"RMSE position : {rmse:.4f} m")
-
-# Visualisation
 fig = plt.figure(figsize=(9, 7))
 ax = fig.add_subplot(111, projection="3d")
-
-ax.plot(
-    true_positions[:, 0],
-    true_positions[:, 1],
-    true_positions[:, 2],
-    "g-", label="Trajectoire réelle", linewidth=2
-)
-
-ax.plot(
-    estimated_positions[:, 0],
-    estimated_positions[:, 1],
-    estimated_positions[:, 2],
-    "r--", label="Trajectoire estimée", linewidth=2
-)
-
-ax.scatter(
-    *true_positions[0],
-    color="blue", s=60, label="Départ"
-)
-
-ax.set_xlabel("X (m)")
-ax.set_ylabel("Y (m)")
-ax.set_zlabel("Z (m)")
-ax.set_title("Odométrie visuelle - Simulation 3D")
+ax.plot(*truth.T, "g-", label="Ground truth", linewidth=2)
+ax.plot(*estimated.T, "r--", label="Estimated (oracle scale)", linewidth=2)
+ax.scatter(*truth[0], color="blue", s=60, label="Start")
+ax.set(xlabel="X (m)", ylabel="Y (m)", zlabel="Z (m)",
+       title="Synthetic monocular VO — oracle-scale evaluation")
 ax.legend()
+fig.tight_layout()
+fig.savefig(OUT / "trajectory_3d.png", dpi=180)
+plt.close(fig)
 
-plt.tight_layout()
-plt.savefig("results/trajectory_3d.png", dpi=180)
-plt.close()
+fig, ax = plt.subplots(figsize=(9, 4))
+ax.plot(np.arange(N), errors, label="Position error")
+ax.set(xlabel="Frame", ylabel="Euclidean position error (m)",
+       title=f"Accumulated drift (RMSE = {rmse:.3f} m)")
+ax.grid(alpha=.3)
+ax.legend()
+fig.tight_layout()
+fig.savefig(OUT / "position_error.png", dpi=180)
+plt.close(fig)
 
-np.savez(
-    "results/synthetic_trajectory.npz",
-    true_positions=true_positions,
-    estimated_positions=estimated_positions,
-    errors=errors
-)
-
-print("Graphique : results/trajectory_3d.png")
+np.savez(OUT / "synthetic_trajectory.npz", true_positions=truth,
+         estimated_positions=estimated, errors=errors,
+         inlier_counts=np.asarray(inliers_per_step),
+         rotation_errors_deg=np.asarray(rotation_errors_deg),
+         translation_direction_errors_deg=np.asarray(translation_direction_errors_deg))
+print(f"Plots: {OUT / 'trajectory_3d.png'} and {OUT / 'position_error.png'}")
