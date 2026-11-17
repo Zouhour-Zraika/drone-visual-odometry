@@ -21,7 +21,9 @@ points_world = np.column_stack((
     rng.uniform(-3, 3, 1000),
     rng.uniform(6, 18, 1000),
 ))
-# A larger baseline avoids near-zero parallax and unstable cheirality checks.\n# This is a synthetic test condition, not a claim of real drone performance.\ntruth = np.array([[.4*i, .15*np.sin(i/8), .03*i] for i in range(N)])
+# A larger baseline avoids near-zero parallax and unstable cheirality checks.
+# This is a synthetic test condition, not a claim of real drone performance.
+truth = np.array([[.4*i, .15*np.sin(i/8), .03*i] for i in range(N)])
 
 def project(center):
     camera_points = points_world - center
