@@ -45,7 +45,7 @@ def stereo_landmarks(left, right, orb, baseline_m):
     return kp_l, des_l, landmarks
 
 
-def estimate_relative_pose(points_3d, pixels_2d, *, min_inliers=15):
+def estimate_relative_pose(points_3d, pixels_2d, *, min_inliers=15, diagnostics=None):
     """Estimate T_current_previous from 3D previous-camera points to current pixels."""
     points_3d = np.asarray(points_3d, dtype=np.float64)
     pixels_2d = np.asarray(pixels_2d, dtype=np.float64)
@@ -68,6 +68,19 @@ def estimate_relative_pose(points_3d, pixels_2d, *, min_inliers=15):
     transform = np.eye(4, dtype=np.float64)
     transform[:3, :3] = rotation
     transform[:3, 3] = tvec.ravel()
+    if diagnostics is not None:
+        projected, _ = cv2.projectPoints(
+            points_3d[chosen], rvec, tvec, K, None
+        )
+        residuals = np.linalg.norm(
+            projected.reshape(-1, 2) - pixels_2d[chosen], axis=1
+        )
+        diagnostics["reprojection_rmse_px"] = float(
+            np.sqrt(np.mean(residuals ** 2))
+        )
+        diagnostics["reprojection_p90_px"] = float(
+            np.percentile(residuals, 90)
+        )
     return transform, count
 
 
@@ -80,6 +93,13 @@ def run(root, max_frames, baseline_m, min_inliers):
 
     orb = cv2.ORB_create(nfeatures=3000)
     trajectory = [np.zeros(3)]
+    poses = [np.eye(4, dtype=np.float64)]
+    temporal_match_counts = [0]
+    pnp_correspondence_counts = [0]
+    pnp_inlier_ratios = [np.nan]
+    reprojection_rmse_px = [np.nan]
+    reprojection_p90_px = [np.nan]
+    processing_time_ms = [np.nan]
     frame_ids = [frames[0].index]
     timestamps = [frames[0].timestamp_s]
     inlier_counts = [0]
@@ -91,15 +111,17 @@ def run(root, max_frames, baseline_m, min_inliers):
     start = perf_counter()
 
     for frame in frames[1:]:
+        frame_start = perf_counter()
         left, right = read_pair(frame)
         kp, des, landmarks = stereo_landmarks(left, right, orb, baseline_m)
         temporal = ratio_matches(prev_des, des)
         linked = [(prev_landmarks[m.queryIdx], kp[m.trainIdx].pt)
                   for m in temporal if m.queryIdx in prev_landmarks]
+        diagnostics = {}
         transform, count = (estimate_relative_pose(
             np.asarray([p for p, _ in linked]),
             np.asarray([uv for _, uv in linked]),
-            min_inliers=min_inliers,
+            min_inliers=min_inliers, diagnostics=diagnostics,
         ) if len(linked) >= 6 else (None, 0))
 
         if transform is None:
@@ -112,6 +134,17 @@ def run(root, max_frames, baseline_m, min_inliers):
             success = True
 
         trajectory.append(T_world_previous[:3, 3].copy())
+        poses.append(T_world_previous.copy())
+        temporal_match_counts.append(len(temporal))
+        pnp_correspondence_counts.append(len(linked))
+        pnp_inlier_ratios.append(count / len(linked) if linked else np.nan)
+        reprojection_rmse_px.append(
+            diagnostics.get("reprojection_rmse_px", np.nan)
+        )
+        reprojection_p90_px.append(
+            diagnostics.get("reprojection_p90_px", np.nan)
+        )
+        processing_time_ms.append((perf_counter() - frame_start) * 1000)
         frame_ids.append(frame.index)
         timestamps.append(frame.timestamp_s)
         inlier_counts.append(count)
@@ -124,6 +157,13 @@ def run(root, max_frames, baseline_m, min_inliers):
     elapsed = perf_counter() - start
     return {
         "positions": np.asarray(trajectory),
+        "poses_world_camera": np.asarray(poses),
+        "temporal_match_counts": np.asarray(temporal_match_counts),
+        "pnp_correspondence_counts": np.asarray(pnp_correspondence_counts),
+        "pnp_inlier_ratios": np.asarray(pnp_inlier_ratios),
+        "reprojection_rmse_px": np.asarray(reprojection_rmse_px),
+        "reprojection_p90_px": np.asarray(reprojection_p90_px),
+        "processing_time_ms": np.asarray(processing_time_ms),
         "frame_ids": np.asarray(frame_ids),
         "timestamps_s": np.asarray(timestamps),
         "inlier_counts": np.asarray(inlier_counts),
@@ -156,6 +196,12 @@ def main():
     print(f"Elapsed: {result['elapsed_s']:.2f} s; "
           f"throughput: {(n-1)/result['elapsed_s']:.2f} frame pairs/s")
     print(f"Final camera position relative to first frame: {result['positions'][-1]}")
+    valid = result["success"][1:]
+    if np.any(valid):
+        print(f"Median PnP reprojection RMSE: "
+              f"{np.nanmedian(result['reprojection_rmse_px'][1:][valid]):.3f} px")
+    print(f"Median per-frame processing: "
+          f"{np.nanmedian(result['processing_time_ms'][1:]):.2f} ms")
     print(f"Saved: {args.output}")
     print("WARNING: not ground-truth aligned; baseline units not independently verified.")
 
