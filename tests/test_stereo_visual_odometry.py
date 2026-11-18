@@ -22,9 +22,12 @@ class PnPTests(unittest.TestCase):
         tvec = np.array([0.08, -0.03, 0.04])
         pixels, _ = cv2.projectPoints(points, rvec, tvec, K, None)
         pixels = pixels.reshape(-1, 2) + rng.normal(0, 0.2, (120, 2))
-        transform, count = estimate_relative_pose(points, pixels, min_inliers=50)
+        diagnostics = {}
+        transform, count = estimate_relative_pose(points, pixels, min_inliers=50, diagnostics=diagnostics)
         self.assertIsNotNone(transform)
         self.assertGreater(count, 100)
+        self.assertLess(diagnostics["reprojection_rmse_px"], 1.0)
+        self.assertLess(diagnostics["reprojection_p90_px"], 1.0)
         np.testing.assert_allclose(transform[:3, 3], tvec, atol=0.025)
 
     def test_insufficient_correspondences(self):
